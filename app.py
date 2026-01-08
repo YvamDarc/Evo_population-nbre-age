@@ -1,169 +1,278 @@
 import io
 import time
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="INSEE brut par commune", layout="wide")
+st.set_page_config(page_title="INSEE brut par commune (data.gouv)", layout="wide")
 
 UA = {"User-Agent": "insee-brut/1.0"}
+CACHE_DIR = Path("/tmp/insee_cache")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# -----------------------
-# 1) Sélection commune (geo.api.gouv.fr)
-# -----------------------
-@st.cache_data(ttl=24*3600)
-def search_communes(q: str):
-    # recherche par nom ou code postal, renvoie une liste de communes
+# ✅ Ton URL
+AGE_URL = "https://www.data.gouv.fr/api/1/datasets/r/7e3937bb-e815-4e58-92d4-d7ef478abcc0"
+
+
+# -----------------------------
+# Helpers: HTTP + diagnostics
+# -----------------------------
+def http_get_with_diagnostics(
+    url: str,
+    timeout: int = 180,
+    stream: bool = True,
+) -> Tuple[bytes, Dict]:
+    """
+    Télécharge une ressource en suivant les redirects et renvoie:
+    - bytes du contenu
+    - dict diagnostic (status, redirects, headers, size, timings)
+    """
+    diag = {
+        "requested_url": url,
+        "final_url": None,
+        "status_code": None,
+        "content_type": None,
+        "content_length_header": None,
+        "downloaded_bytes": None,
+        "elapsed_seconds": None,
+        "redirect_chain": [],
+        "response_headers_sample": {},
+    }
+
+    t0 = time.time()
+    r = requests.get(url, timeout=timeout, headers=UA, allow_redirects=True, stream=stream)
+    elapsed = time.time() - t0
+
+    diag["elapsed_seconds"] = round(elapsed, 3)
+    diag["status_code"] = r.status_code
+    diag["final_url"] = r.url
+    diag["content_type"] = r.headers.get("Content-Type")
+    diag["content_length_header"] = r.headers.get("Content-Length")
+
+    # Redirect chain
+    if r.history:
+        for h in r.history:
+            diag["redirect_chain"].append({"status": h.status_code, "url": h.url})
+        diag["redirect_chain"].append({"status": r.status_code, "url": r.url})
+    else:
+        diag["redirect_chain"] = [{"status": r.status_code, "url": r.url}]
+
+    # Sample headers (pour debug sans spam)
+    keep = ["Content-Type", "Content-Length", "Content-Disposition", "Cache-Control", "ETag", "Last-Modified"]
+    diag["response_headers_sample"] = {k: r.headers.get(k) for k in keep if r.headers.get(k) is not None}
+
+    r.raise_for_status()
+
+    # Si c'est JSON (parfois l'API renvoie un JSON qui contient un lien), on gère
+    ctype = (r.headers.get("Content-Type") or "").lower()
+    if "application/json" in ctype:
+        data = r.json()
+        # Tentatives de trouver une URL dans la réponse JSON (selon structures possibles)
+        possible = []
+        if isinstance(data, dict):
+            for key in ["url", "download_url", "latest", "href"]:
+                if key in data and isinstance(data[key], str):
+                    possible.append(data[key])
+            # Structures imbriquées fréquentes
+            for path in [("resource", "url"), ("resource", "download_url"), ("data", "url")]:
+                cur = data
+                ok = True
+                for p in path:
+                    if isinstance(cur, dict) and p in cur:
+                        cur = cur[p]
+                    else:
+                        ok = False
+                        break
+                if ok and isinstance(cur, str):
+                    possible.append(cur)
+
+        possible = [u for u in possible if u.startswith("http")]
+        if possible:
+            # On retélécharge le binaire via l'URL trouvée
+            url2 = possible[0]
+            diag["json_followup_url"] = url2
+            t1 = time.time()
+            r2 = requests.get(url2, timeout=timeout, headers=UA, allow_redirects=True, stream=stream)
+            diag["json_followup_elapsed_seconds"] = round(time.time() - t1, 3)
+            diag["json_followup_final_url"] = r2.url
+            diag["json_followup_status"] = r2.status_code
+            r2.raise_for_status()
+            content = r2.content
+            diag["downloaded_bytes"] = len(content)
+            return content, diag
+        else:
+            raise RuntimeError("Réponse JSON reçue mais impossible d’en extraire une URL de téléchargement.")
+
+    # Sinon: binaire direct
+    content = r.content
+    diag["downloaded_bytes"] = len(content)
+    return content, diag
+
+
+def download_to_cache(url: str, filename: str, max_age_days: int = 120) -> Tuple[Path, Dict]:
+    """
+    Télécharge vers /tmp si absent ou trop vieux.
+    Retourne:
+      - path fichier
+      - diag téléchargement (ou diag "cache hit")
+    """
+    path = CACHE_DIR / filename
+
+    if path.exists():
+        age_days = (time.time() - path.stat().st_mtime) / 86400
+        if age_days <= max_age_days:
+            return path, {
+                "cache": "HIT",
+                "path": str(path),
+                "age_days": round(age_days, 2),
+                "size_bytes": path.stat().st_size,
+            }
+
+    content, diag = http_get_with_diagnostics(url)
+    path.write_bytes(content)
+    diag.update({"cache": "MISS->SAVED", "path": str(path)})
+    return path, diag
+
+
+# -----------------------------
+# Commune selection (geo.api.gouv.fr)
+# -----------------------------
+@st.cache_data(ttl=24 * 3600)
+def search_communes(query: str) -> List[dict]:
     url = "https://geo.api.gouv.fr/communes"
-    params = {"nom": q, "fields": "nom,code,codeDepartement", "boost": "population", "limit": 15}
+    params = {"nom": query, "fields": "nom,code,codeDepartement", "boost": "population", "limit": 20}
     r = requests.get(url, params=params, timeout=20, headers=UA)
     r.raise_for_status()
     return r.json()
 
-# -----------------------
-# 2) Population (2012-2024) via OFGL (API Opendatasoft)
-# -----------------------
-@st.cache_data(ttl=6*3600)
-def ofgl_population_series(code_insee: str) -> pd.DataFrame:
+
+# -----------------------------
+# INSEE "âge" loader (XLSX)
+# -----------------------------
+@st.cache_data(ttl=7 * 24 * 3600, show_spinner=True)
+def load_age_xlsx(path: str) -> pd.DataFrame:
+    # lecture Excel (une seule fois grâce au cache)
+    # engine openpyxl auto via pandas
+    df = pd.read_excel(path)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def detect_code_insee_column(df: pd.DataFrame) -> str:
     """
-    Dataset OFGL: populations-ofgl-communes (2012-2024)
-    API Opendatasoft v2.1.
-    On récupère uniquement les lignes de la commune => léger.
+    Détection robuste de la colonne code INSEE.
     """
-    base = "https://data.ofgl.fr/api/explore/v2.1/catalog/datasets/populations-ofgl-communes/records"
-    # on ne connait pas à 100% le nom exact du champ code INSEE, donc on essaie plusieurs "where"
-    wheres = [
-        f"codgeo='{code_insee}'",
-        f"code_insee='{code_insee}'",
-        f"code='{code_insee}'",
-        f"insee='{code_insee}'",
-        f"codgeo='{code_insee}'",
-    ]
+    candidates = []
+    for c in df.columns:
+        cl = str(c).lower()
+        if "cod" in cl and ("geo" in cl or "géo" in cl or "insee" in cl):
+            candidates.append(c)
+    # fallback usuels
+    for name in ["CODGEO", "Code", "code", "code_insee", "INSEE Code géographique", "Code géographique"]:
+        if name in df.columns:
+            return name
+    if candidates:
+        return candidates[0]
+    # dernier recours: première colonne
+    return df.columns[0]
 
-    last_err = None
-    for w in wheres:
-        try:
-            params = {"where": w, "limit": 100, "order_by": "annee"}
-            r = requests.get(base, params=params, timeout=25, headers=UA)
-            r.raise_for_status()
-            data = r.json()
-            results = data.get("results", [])
-            if results:
-                df = pd.DataFrame(results)
-                # on tente de normaliser colonnes usuelles
-                # (selon les portails, ça peut être "annee" + "population")
-                return df
-        except Exception as e:
-            last_err = e
 
-    raise RuntimeError(f"Aucune donnée retournée pour {code_insee} (erreur: {last_err})")
-
-# -----------------------
-# 3) Âge (1 année) via data.gouv (fichier xlsx) - filtrage commune
-# -----------------------
-CACHE_DIR = Path("/tmp/insee_cache")
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-AGE_XLSX_URL = None  # <- tu colleras ici l'URL "Télécharger" du xlsx depuis data.gouv
-
-def download_cached(url: str, filename: str, max_age_days: int = 60) -> bytes:
-    path = CACHE_DIR / filename
-    if path.exists():
-        age_days = (time.time() - path.stat().st_mtime) / 86400
-        if age_days <= max_age_days:
-            return path.read_bytes()
-    r = requests.get(url, timeout=60, headers=UA)
-    r.raise_for_status()
-    path.write_bytes(r.content)
-    return r.content
-
-@st.cache_data(ttl=7*24*3600)
-def age_structure_one_year(code_insee: str) -> pd.DataFrame:
-    """
-    Lit un fichier xlsx (population par âges) et filtre la commune.
-    IMPORTANT: il faut renseigner AGE_XLSX_URL (lien direct du xlsx).
-    """
-    if not AGE_XLSX_URL:
-        raise RuntimeError("AGE_XLSX_URL non renseignée : colle le lien direct du fichier xlsx data.gouv dans le code.")
-
-    content = download_cached(AGE_XLSX_URL, "age_2020_tranches.xlsx", max_age_days=120)
-    df = pd.read_excel(io.BytesIO(content))
-
-    # Le dataset indique un champ "INSEE Code géographique" (et nom de commune, etc.)
-    # On fait une recherche flexible
-    possible_cols = [c for c in df.columns if "code" in str(c).lower() and "géo" in str(c).lower() or "insee" in str(c).lower()]
-    if not possible_cols:
-        possible_cols = df.columns.tolist()
-
-    # test de colonnes courantes
-    code_cols_try = ["INSEE Code géographique", "CODGEO", "codgeo", "Code", "code_insee"]
-    code_col = next((c for c in code_cols_try if c in df.columns), None)
-    if code_col is None:
-        # fallback: première colonne candidate
-        code_col = possible_cols[0]
-
-    df[code_col] = df[code_col].astype(str).str.zfill(5)
-    out = df[df[code_col] == code_insee].copy()
-    return out
-
-# -----------------------
+# -----------------------------
 # UI
-# -----------------------
-st.title("Récupération INSEE “brut” par commune")
+# -----------------------------
+st.title("Structure d’âge – INSEE brut par commune (via data.gouv)")
 
-q = st.text_input("Commune (nom) ou ville", value="Dinan")
-if not q.strip():
-    st.stop()
+with st.expander("🧪 Diagnostic (à ouvrir en cas de lenteur/erreur)", expanded=False):
+    st.write("Cette app télécharge un fichier (~38 Mo) une seule fois, le met en cache /tmp, puis filtre la commune.")
+    st.write(f"Cache dir: `{CACHE_DIR}`")
+    st.write(f"URL utilisée: `{AGE_URL}`")
 
-with st.spinner("Recherche commune..."):
-    communes = search_communes(q.strip())
+colL, colR = st.columns([0.45, 0.55], gap="large")
 
-if not communes:
-    st.warning("Aucune commune trouvée.")
-    st.stop()
+with colL:
+    st.subheader("1) Choisir la commune")
+    q = st.text_input("Nom de commune", value="Dinan")
+    if not q.strip():
+        st.stop()
 
-options = {f"{c['nom']} ({c['code']})": c["code"] for c in communes}
-label = st.selectbox("Sélection", list(options.keys()))
-code_insee = options[label]
-
-st.success(f"Commune sélectionnée : {label}")
-
-tab1, tab2 = st.tabs(["Population (OFGL 2012-2024)", "Âges (dataset data.gouv)"])
-
-with tab1:
-    st.subheader("Population – série (données brutes)")
+    communes = []
     try:
-        df_pop = ofgl_population_series(code_insee)
-        st.caption("Affichage tel que renvoyé par l’API (brut).")
-        st.dataframe(df_pop, width="stretch", height=380)
-
-        st.download_button(
-            "Télécharger CSV (brut)",
-            data=df_pop.to_csv(index=False).encode("utf-8"),
-            file_name=f"population_ofgl_{code_insee}.csv",
-            mime="text/csv",
-        )
+        with st.spinner("Recherche commune..."):
+            communes = search_communes(q.strip())
     except Exception as e:
-        st.error(str(e))
-        st.info("Astuce : clique sur 'Télécharger CSV' quand ça marche pour voir les colonnes exactes.")
+        st.error(f"Erreur geo.api.gouv.fr : {e}")
+        st.stop()
 
-with tab2:
-    st.subheader("Structure d’âge – brut (une année)")
-    st.warning(
-        "Ici on lit un fichier XLSX data.gouv : c’est rapide si le lien est bon + cache /tmp, "
-        "mais il faut coller le lien direct du fichier dans AGE_XLSX_URL."
+    if not communes:
+        st.warning("Aucune commune trouvée.")
+        st.stop()
+
+    options = {f"{c['nom']} ({c['code']})": c["code"] for c in communes}
+    label = st.selectbox("Sélection", list(options.keys()))
+    code_insee = options[label]
+    st.success(f"Commune sélectionnée : {label}")
+
+    st.subheader("2) Télécharger + lire le fichier âges")
+    run = st.button("📦 Charger les données âges (brut)")
+
+    show_diag = st.checkbox("Afficher le diagnostic détaillé", value=True)
+
+with colR:
+    st.subheader("Résultat")
+
+    if not run:
+        st.info("Clique **Charger les données âges** pour lancer le téléchargement/lecture (une seule fois puis cache).")
+        st.stop()
+
+    # 1) download (cached)
+    try:
+        path, diag = download_to_cache(AGE_URL, filename="ages_communes.xlsx", max_age_days=120)
+    except Exception as e:
+        st.error("Échec téléchargement.")
+        st.exception(e)
+        st.stop()
+
+    if show_diag:
+        st.markdown("### Diagnostic téléchargement / cache")
+        st.json(diag)
+
+    # 2) read (cached)
+    try:
+        df = load_age_xlsx(str(path))
+    except Exception as e:
+        st.error("Téléchargement OK mais lecture Excel KO (format inattendu ou fichier non-xlsx).")
+        st.exception(e)
+        # petit indice utile
+        st.write("Astuce: regarde `content_type` dans le diagnostic, si c’est du HTML/JSON au lieu d’un XLSX.")
+        st.stop()
+
+    # 3) detect code column + filter
+    code_col = detect_code_insee_column(df)
+    df[code_col] = df[code_col].astype(str).str.zfill(5)
+
+    out = df[df[code_col] == code_insee].copy()
+
+    st.markdown("### Données brutes (ligne(s) de la commune)")
+    st.caption(f"Colonne code INSEE détectée : `{code_col}` | lignes trouvées : {len(out)}")
+    st.dataframe(out, width="stretch", height=420)
+
+    if len(out) == 0:
+        st.warning(
+            "Aucune ligne trouvée pour ce code INSEE dans le fichier.\n"
+            "Ca arrive si le fichier n’est pas au niveau 'communes' (ou si la colonne code n’est pas détectée correctement)."
+        )
+
+    # 4) export brut
+    st.download_button(
+        "⬇️ Télécharger CSV (brut) pour cette commune",
+        data=out.to_csv(index=False).encode("utf-8"),
+        file_name=f"ages_brut_{code_insee}.csv",
+        mime="text/csv",
     )
-    if st.button("Charger âges (brut) pour cette commune"):
-        try:
-            df_age = age_structure_one_year(code_insee)
-            st.dataframe(df_age, width="stretch", height=380)
-            st.download_button(
-                "Télécharger CSV âges (brut)",
-                data=df_age.to_csv(index=False).encode("utf-8"),
-                file_name=f"ages_{code_insee}.csv",
-                mime="text/csv",
-            )
-        except Exception as e:
-            st.error(str(e))
+
+    # 5) aperçu colonnes (utile pour comprendre le fichier)
+    with st.expander("Voir les colonnes du fichier (pour debug)", expanded=False):
+        st.write(df.columns.tolist())
