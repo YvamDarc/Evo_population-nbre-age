@@ -345,26 +345,8 @@ def bucket_timeseries_zone(df_zone: pd.DataFrame, bucket_map: Dict[str, str]) ->
     return pivot
 
 
-def mean_age_timeseries_zone(df_zone: pd.DataFrame, mid_map: Dict[str, float]) -> pd.Series:
-    d = df_zone.copy()
-    d["TIME_PERIOD"] = d["TIME_PERIOD"].astype(str)
-    d["OBS_VALUE"] = pd.to_numeric(d["OBS_VALUE"], errors="coerce").fillna(0.0)
-    d["AGE"] = d["AGE"].astype(str)
-
-    d["age_mid"] = d["AGE"].map(mid_map)
-    d = d.dropna(subset=["age_mid"])
-
-    # moyenne pondérée par année (vectorisée)
-    d["w"] = d["age_mid"] * d["OBS_VALUE"]
-    g = d.groupby("TIME_PERIOD", as_index=True).agg(num=("w", "sum"), den=("OBS_VALUE", "sum"))
-    g["age_moyen_approx"] = g["num"] / g["den"].replace(0, np.nan)
-    g = g.dropna(subset=["age_moyen_approx"])
-    g = g.loc[sort_years(g.index.tolist())]
-    return g["age_moyen_approx"]
-
-
 # =========================
-# APP UI (wrapped in try for in-app error display)
+# APP UI (with in-app traceback)
 # =========================
 try:
     st.title("Zone de chalandise + évolutions population & tranches d’âge (INSEE upload)")
@@ -423,7 +405,7 @@ try:
         edited = st.data_editor(
             view,
             hide_index=True,
-            width="stretch",
+            use_container_width=True,
             column_config={
                 "ajouter": st.column_config.CheckboxColumn("Ajouter"),
                 "dist_km": st.column_config.NumberColumn("Distance (km)", format="%.1f"),
@@ -450,7 +432,8 @@ try:
         for _, r in sample.iterrows():
             folium.CircleMarker([r["lat"], r["lon"]], radius=4, tooltip=f"{r['nom']} ({r['code_insee']})").add_to(m)
 
-        st_folium(m, width="stretch", height=420)
+        # ✅ width MUST be int here
+        st_folium(m, width=900, height=420)
 
         sel = sorted(list(st.session_state["selected_codes"]))
         if not sel:
@@ -461,8 +444,7 @@ try:
             st.info("➡️ Upload ton fichier âges CSV pour continuer.")
             st.stop()
 
-        # ---- controls to avoid chart overload
-        st.subheader("Paramètres des graphiques")
+        st.subheader("Paramètres graphiques")
         top_n = st.slider("Nombre max de communes affichées (Graph 1)", 3, 60, 15, 1)
         sex_mode = st.selectbox(
             "Sexe (si colonne SEX présente)",
@@ -475,16 +457,14 @@ try:
             index=0,
         )
 
-        # ---- read age CSV
-        with st.spinner("Lecture du fichier âges (peut être long)..."):
-            age_bytes = age_file.getvalue()
-            df_raw, age_diag = read_uploaded_csv_smart(age_bytes)
+        with st.spinner("Lecture CSV âges..."):
+            df_raw, age_diag = read_uploaded_csv_smart(age_file.getvalue())
 
         needed = [c for c in ["AGE", "GEO", "TIME_PERIOD", "SEX", "OBS_VALUE"] if c in df_raw.columns]
         df = df_raw[needed].copy()
         del df_raw
 
-        if "AGE" not in df.columns or "GEO" not in df.columns or "TIME_PERIOD" not in df.columns or "OBS_VALUE" not in df.columns:
+        if not {"AGE", "GEO", "TIME_PERIOD", "OBS_VALUE"}.issubset(set(df.columns)):
             raise RuntimeError(f"Colonnes nécessaires absentes. Colonnes trouvées: {df.columns.tolist()}")
 
         if diag_mode:
@@ -502,11 +482,9 @@ try:
                 }
             )
 
-        # ---- optional concordance
         geo_to_insee = None
         if conc_file is not None:
-            conc_bytes = conc_file.getvalue()
-            df_conc, conc_diag = read_uploaded_csv_smart(conc_bytes)
+            df_conc, conc_diag = read_uploaded_csv_smart(conc_file.getvalue())
             geo_guess, insee_guess = guess_concordance_columns(df_conc.columns.tolist())
 
             st.markdown("### Concordance (optionnelle)")
@@ -528,24 +506,7 @@ try:
             if "geo_to_insee" in st.session_state:
                 geo_to_insee = st.session_state["geo_to_insee"]
 
-            if diag_mode:
-                st.json(
-                    {
-                        "conc_rows": conc_diag.get("rows"),
-                        "conc_cols": conc_diag.get("cols"),
-                        "conc_sep": conc_diag.get("sep_used"),
-                        "conc_encoding": conc_diag.get("encoding_used"),
-                    }
-                )
-
-        # ---- normalize codes + filter zone early
         df = normalize_codes(df, geo_to_insee)
-        mapped_ok = float(df["CODE_INSEE"].notna().mean()) if len(df) else 0.0
-        if diag_mode:
-            st.markdown("### Diagnostic mapping GEO → CODE_INSEE")
-            st.write(f"Taux de lignes avec CODE_INSEE: **{mapped_ok*100:.1f}%**")
-            st.dataframe(df[["GEO", "CODE_INSEE"]].dropna().head(20), width="stretch", height=220)
-
         df_zone = df[df["CODE_INSEE"].isin(sel)].copy()
         if df_zone.empty:
             raise RuntimeError("Après mapping + filtrage zone, aucune ligne ne correspond aux communes sélectionnées.")
@@ -557,21 +518,17 @@ try:
             raise RuntimeError("Aucune année TIME_PERIOD exploitable après filtrage zone.")
         st.caption(f"Années disponibles (zone) : {years[0]} → {years[-1]} ({len(years)} points)")
 
-        # ---- maps AGE -> bucket & midpoint (built on zone unique AGE to be fast)
+        # AGE maps based on zone (fast)
         age_values = df_zone["AGE"].dropna().astype(str).unique().tolist()
-        bucket_map, mid_map = build_age_maps(age_values)
+        bucket_map, _mid_map = build_age_maps(age_values)
 
-        # ---- name map for legends
+        # Name map for legend
         name_map = dict(zip(in_radius["code_insee"].astype(str).tolist(), in_radius["nom"].astype(str).tolist()))
 
-        # =========================================================
-        # GRAPH 1: Population by commune + total zone
-        # =========================================================
+        # -------- Graph 1
         st.markdown("## 1) Évolution de la population (communes + total zone)")
-
         pop_long = pop_timeseries_by_commune(df_zone)
 
-        # select top N communes by latest year population
         latest_year = years[-1]
         latest = pop_long[pop_long["TIME_PERIOD"] == latest_year].copy()
         top_codes = (
@@ -583,12 +540,11 @@ try:
             .tolist()
         )
 
-        pop_long_top = pop_long[pop_long["CODE_INSEE"].astype(str).isin(top_codes)].copy()
-
-        pop_pivot = pop_long_top.pivot(index="TIME_PERIOD", columns="CODE_INSEE", values="population").fillna(0).astype(int)
+        pop_top = pop_long[pop_long["CODE_INSEE"].astype(str).isin(top_codes)].copy()
+        pop_pivot = pop_top.pivot(index="TIME_PERIOD", columns="CODE_INSEE", values="population").fillna(0).astype(int)
         pop_pivot = pop_pivot.loc[sort_years(pop_pivot.index.tolist())]
 
-        # rename columns (avoid duplicates)
+        # rename cols
         newcols = {}
         used = set()
         for code in pop_pivot.columns.astype(str).tolist():
@@ -600,41 +556,16 @@ try:
             newcols[code] = label
         pop_pivot.columns = [newcols.get(str(c), str(c)) for c in pop_pivot.columns]
 
-        # total zone = sum all communes selected (not only top N)
         pop_total_zone = pop_long.groupby("TIME_PERIOD")["population"].sum()
         pop_total_zone = pop_total_zone.loc[sort_years(pop_total_zone.index.tolist())]
         pop_pivot["TOTAL ZONE"] = pop_total_zone.reindex(pop_pivot.index).fillna(0).astype(int)
 
-        st.line_chart(pop_pivot)
+        st.line_chart(pop_pivot, use_container_width=True)
 
-        st.download_button(
-            "⬇️ Télécharger CSV - population (TOP communes + total zone)",
-            data=pop_pivot.reset_index().to_csv(index=False).encode("utf-8"),
-            file_name="population_zone_timeseries_topN.csv",
-            mime="text/csv",
-        )
-
-        # =========================================================
-        # GRAPH 2: Age buckets evolution for zone
-        # =========================================================
+        # -------- Graph 2
         st.markdown("## 2) Évolution de la population par tranches d’âge (zone)")
-
         bucket_pivot = bucket_timeseries_zone(df_zone, bucket_map)
-        st.line_chart(bucket_pivot)
-
-        st.download_button(
-            "⬇️ Télécharger CSV - tranches d’âge (zone)",
-            data=bucket_pivot.reset_index().to_csv(index=False).encode("utf-8"),
-            file_name="age_buckets_zone_timeseries.csv",
-            mime="text/csv",
-        )
-
-        # =========================================================
-        # BONUS: Mean age approx
-        # =========================================================
-        st.markdown("## Bonus : âge moyen approximatif (zone) par année")
-        mean_series = mean_age_timeseries_zone(df_zone, mid_map)
-        st.line_chart(mean_series)
+        st.line_chart(bucket_pivot, use_container_width=True)
 
 except Exception as e:
     st.error("Erreur dans l'app (trace ci-dessous) :")
