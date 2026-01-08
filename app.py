@@ -1,278 +1,411 @@
 import io
+import math
 import time
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional, List, Dict, Tuple
 
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import folium
+from streamlit_folium import st_folium
 
-st.set_page_config(page_title="INSEE brut par commune (data.gouv)", layout="wide")
+st.set_page_config(page_title="Zone + Démographie (upload INSEE)", layout="wide")
 
-UA = {"User-Agent": "insee-brut/1.0"}
-CACHE_DIR = Path("/tmp/insee_cache")
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+UA = {"User-Agent": "zone-demographie-upload/1.0"}
+GEO_COMMUNES_URL = "https://geo.api.gouv.fr/communes"
+GEOCODE_URL = "https://data.geopf.fr/geocodage/search/"
 
-# ✅ Ton URL
-AGE_URL = "https://www.data.gouv.fr/api/1/datasets/r/7e3937bb-e815-4e58-92d4-d7ef478abcc0"
+# -----------------------------
+# Utils
+# -----------------------------
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def safe_int(x):
+    try:
+        if pd.isna(x):
+            return np.nan
+        if isinstance(x, str):
+            x = x.replace("\u202f", "").replace(" ", "").replace(",", ".")
+        return int(float(x))
+    except Exception:
+        return np.nan
 
 
 # -----------------------------
-# Helpers: HTTP + diagnostics
+# Geo helpers
 # -----------------------------
-def http_get_with_diagnostics(
-    url: str,
-    timeout: int = 180,
-    stream: bool = True,
-) -> Tuple[bytes, Dict]:
-    """
-    Télécharge une ressource en suivant les redirects et renvoie:
-    - bytes du contenu
-    - dict diagnostic (status, redirects, headers, size, timings)
-    """
-    diag = {
-        "requested_url": url,
-        "final_url": None,
-        "status_code": None,
-        "content_type": None,
-        "content_length_header": None,
-        "downloaded_bytes": None,
-        "elapsed_seconds": None,
-        "redirect_chain": [],
-        "response_headers_sample": {},
-    }
-
-    t0 = time.time()
-    r = requests.get(url, timeout=timeout, headers=UA, allow_redirects=True, stream=stream)
-    elapsed = time.time() - t0
-
-    diag["elapsed_seconds"] = round(elapsed, 3)
-    diag["status_code"] = r.status_code
-    diag["final_url"] = r.url
-    diag["content_type"] = r.headers.get("Content-Type")
-    diag["content_length_header"] = r.headers.get("Content-Length")
-
-    # Redirect chain
-    if r.history:
-        for h in r.history:
-            diag["redirect_chain"].append({"status": h.status_code, "url": h.url})
-        diag["redirect_chain"].append({"status": r.status_code, "url": r.url})
-    else:
-        diag["redirect_chain"] = [{"status": r.status_code, "url": r.url}]
-
-    # Sample headers (pour debug sans spam)
-    keep = ["Content-Type", "Content-Length", "Content-Disposition", "Cache-Control", "ETag", "Last-Modified"]
-    diag["response_headers_sample"] = {k: r.headers.get(k) for k in keep if r.headers.get(k) is not None}
-
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def geocode_search(q: str, limit: int = 8):
+    params = {"q": q, "limit": limit}
+    r = requests.get(GEOCODE_URL, params=params, timeout=25, headers=UA)
     r.raise_for_status()
-
-    # Si c'est JSON (parfois l'API renvoie un JSON qui contient un lien), on gère
-    ctype = (r.headers.get("Content-Type") or "").lower()
-    if "application/json" in ctype:
-        data = r.json()
-        # Tentatives de trouver une URL dans la réponse JSON (selon structures possibles)
-        possible = []
-        if isinstance(data, dict):
-            for key in ["url", "download_url", "latest", "href"]:
-                if key in data and isinstance(data[key], str):
-                    possible.append(data[key])
-            # Structures imbriquées fréquentes
-            for path in [("resource", "url"), ("resource", "download_url"), ("data", "url")]:
-                cur = data
-                ok = True
-                for p in path:
-                    if isinstance(cur, dict) and p in cur:
-                        cur = cur[p]
-                    else:
-                        ok = False
-                        break
-                if ok and isinstance(cur, str):
-                    possible.append(cur)
-
-        possible = [u for u in possible if u.startswith("http")]
-        if possible:
-            # On retélécharge le binaire via l'URL trouvée
-            url2 = possible[0]
-            diag["json_followup_url"] = url2
-            t1 = time.time()
-            r2 = requests.get(url2, timeout=timeout, headers=UA, allow_redirects=True, stream=stream)
-            diag["json_followup_elapsed_seconds"] = round(time.time() - t1, 3)
-            diag["json_followup_final_url"] = r2.url
-            diag["json_followup_status"] = r2.status_code
-            r2.raise_for_status()
-            content = r2.content
-            diag["downloaded_bytes"] = len(content)
-            return content, diag
-        else:
-            raise RuntimeError("Réponse JSON reçue mais impossible d’en extraire une URL de téléchargement.")
-
-    # Sinon: binaire direct
-    content = r.content
-    diag["downloaded_bytes"] = len(content)
-    return content, diag
-
-
-def download_to_cache(url: str, filename: str, max_age_days: int = 120) -> Tuple[Path, Dict]:
-    """
-    Télécharge vers /tmp si absent ou trop vieux.
-    Retourne:
-      - path fichier
-      - diag téléchargement (ou diag "cache hit")
-    """
-    path = CACHE_DIR / filename
-
-    if path.exists():
-        age_days = (time.time() - path.stat().st_mtime) / 86400
-        if age_days <= max_age_days:
-            return path, {
-                "cache": "HIT",
-                "path": str(path),
-                "age_days": round(age_days, 2),
-                "size_bytes": path.stat().st_size,
+    data = r.json()
+    feats = data.get("features", [])
+    out = []
+    for f in feats:
+        props = f.get("properties", {}) or {}
+        coords = (f.get("geometry") or {}).get("coordinates", None)
+        if not coords:
+            continue
+        lon, lat = coords[0], coords[1]
+        out.append(
+            {
+                "label": props.get("label", ""),
+                "lat": float(lat),
+                "lon": float(lon),
             }
-
-    content, diag = http_get_with_diagnostics(url)
-    path.write_bytes(content)
-    diag.update({"cache": "MISS->SAVED", "path": str(path)})
-    return path, diag
+        )
+    return out
 
 
-# -----------------------------
-# Commune selection (geo.api.gouv.fr)
-# -----------------------------
-@st.cache_data(ttl=24 * 3600)
-def search_communes(query: str) -> List[dict]:
-    url = "https://geo.api.gouv.fr/communes"
-    params = {"nom": query, "fields": "nom,code,codeDepartement", "boost": "population", "limit": 20}
-    r = requests.get(url, params=params, timeout=20, headers=UA)
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def geo_commune_by_latlon(lat: float, lon: float) -> Optional[dict]:
+    params = {"lat": lat, "lon": lon, "fields": "nom,code,codeDepartement", "format": "json"}
+    r = requests.get(GEO_COMMUNES_URL, params=params, timeout=25, headers=UA)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    if isinstance(data, list) and data:
+        return data[0]
+    return None
 
 
-# -----------------------------
-# INSEE "âge" loader (XLSX)
-# -----------------------------
 @st.cache_data(ttl=7 * 24 * 3600, show_spinner=True)
-def load_age_xlsx(path: str) -> pd.DataFrame:
-    # lecture Excel (une seule fois grâce au cache)
-    # engine openpyxl auto via pandas
-    df = pd.read_excel(path)
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
+def geo_communes_dept(code_dept: str) -> pd.DataFrame:
+    params = {
+        "codeDepartement": code_dept,
+        "fields": "nom,code,codeDepartement,codesPostaux,population,centre",
+        "format": "geojson",
+        "geometry": "centre",
+    }
+    r = requests.get(GEO_COMMUNES_URL, params=params, timeout=60, headers=UA)
+    r.raise_for_status()
+    geojson = r.json()
+
+    feats = geojson.get("features", [])
+    rows = []
+    for f in feats:
+        props = f.get("properties", {}) or {}
+        coords = (f.get("geometry") or {}).get("coordinates", None)
+        if not coords:
+            continue
+        lon, lat = coords[0], coords[1]
+        rows.append(
+            {
+                "code_insee": str(props.get("code")).zfill(5),
+                "nom": props.get("nom"),
+                "code_dept": props.get("codeDepartement"),
+                "codes_postaux": ", ".join(props.get("codesPostaux") or []),
+                "population_geoapi": props.get("population"),
+                "lat": float(lat),
+                "lon": float(lon),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
-def detect_code_insee_column(df: pd.DataFrame) -> str:
+# -----------------------------
+# Upload parsing helpers
+# -----------------------------
+def detect_code_insee_column(cols: List[str]) -> Optional[str]:
+    # plus robustes + tolérants
+    lowered = {c: str(c).lower() for c in cols}
+
+    preferred = [
+        "codgeo", "code insee", "code_insee", "insee", "code géographique", "code geographique",
+        "insee code géographique", "insee code geographique"
+    ]
+    for p in preferred:
+        for c, cl in lowered.items():
+            if cl.strip() == p:
+                return c
+
+    # heuristique
+    for c, cl in lowered.items():
+        if ("geo" in cl or "gé" in cl or "insee" in cl) and "code" in cl:
+            return c
+
+    return None
+
+
+def detect_age_columns(cols: List[str]) -> List[str]:
+    # colonnes type "0-4", "5-9", ..., "95+" ou "100+"
+    out = []
+    for c in cols:
+        s = str(c).strip()
+        if any(ch.isdigit() for ch in s) and (("-" in s) or ("+" in s)):
+            out.append(c)
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def read_uploaded_excel_bytes(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict]:
     """
-    Détection robuste de la colonne code INSEE.
+    Lecture Excel "standard".
+    (On la garde en cache Streamlit pour éviter de relire si l'utilisateur ne change pas le fichier.)
     """
-    candidates = []
-    for c in df.columns:
-        cl = str(c).lower()
-        if "cod" in cl and ("geo" in cl or "géo" in cl or "insee" in cl):
-            candidates.append(c)
-    # fallback usuels
-    for name in ["CODGEO", "Code", "code", "code_insee", "INSEE Code géographique", "Code géographique"]:
-        if name in df.columns:
-            return name
-    if candidates:
-        return candidates[0]
-    # dernier recours: première colonne
-    return df.columns[0]
+    t0 = time.time()
+    xls = pd.ExcelFile(io.BytesIO(file_bytes))
+    sheet = xls.sheet_names[0]
+    df = pd.read_excel(xls, sheet_name=sheet)
+    diag = {
+        "sheet_used": sheet,
+        "rows": int(df.shape[0]),
+        "cols": int(df.shape[1]),
+        "seconds": round(time.time() - t0, 2),
+        "columns": df.columns.tolist()[:50],  # aperçu
+    }
+    return df, diag
+
+
+def midpoint_from_age_group(age_groupe: str) -> Optional[float]:
+    s = str(age_groupe).strip()
+    if "+" in s:
+        try:
+            base = float(s.replace("+", ""))
+            return base + 2.5
+        except Exception:
+            return None
+    if "-" in s:
+        try:
+            a, b = s.split("-")
+            return (float(a) + float(b)) / 2.0
+        except Exception:
+            return None
+    return None
+
+
+def age_buckets_from_row(row: pd.Series, age_cols: List[str]) -> pd.DataFrame:
+    """
+    Transforme une ligne wide (0-4,5-9,...) en table (age_groupe,total),
+    puis en grands groupes 0-14,15-29,...
+    """
+    tmp = pd.DataFrame({"age_groupe": [str(c) for c in age_cols], "total": [row[c] for c in age_cols]})
+    tmp["total"] = tmp["total"].apply(safe_int)
+    tmp = tmp.dropna(subset=["total"])
+
+    tmp["mid"] = tmp["age_groupe"].apply(midpoint_from_age_group)
+
+    def bucket(mid):
+        if mid is None or (isinstance(mid, float) and np.isnan(mid)):
+            return "Inconnu"
+        if mid < 15:
+            return "0-14"
+        if mid < 30:
+            return "15-29"
+        if mid < 45:
+            return "30-44"
+        if mid < 60:
+            return "45-59"
+        if mid < 75:
+            return "60-74"
+        return "75+"
+
+    tmp["bucket"] = tmp["mid"].apply(bucket)
+    g = tmp.groupby("bucket", as_index=False)["total"].sum()
+    return g
+
+
+def approx_mean_age_from_row(row: pd.Series, age_cols: List[str]) -> Optional[float]:
+    tmp = pd.DataFrame({"age_groupe": [str(c) for c in age_cols], "total": [row[c] for c in age_cols]})
+    tmp["total"] = tmp["total"].apply(safe_int)
+    tmp["mid"] = tmp["age_groupe"].apply(midpoint_from_age_group)
+    tmp = tmp.dropna(subset=["total", "mid"])
+    denom = tmp["total"].sum()
+    if denom <= 0:
+        return None
+    return float((tmp["mid"] * tmp["total"]).sum() / denom)
 
 
 # -----------------------------
 # UI
 # -----------------------------
-st.title("Structure d’âge – INSEE brut par commune (via data.gouv)")
+st.title("Zone de chalandise (carte + rayon) + INSEE depuis fichier uploadé")
 
-with st.expander("🧪 Diagnostic (à ouvrir en cas de lenteur/erreur)", expanded=False):
-    st.write("Cette app télécharge un fichier (~38 Mo) une seule fois, le met en cache /tmp, puis filtre la commune.")
-    st.write(f"Cache dir: `{CACHE_DIR}`")
-    st.write(f"URL utilisée: `{AGE_URL}`")
+diag_mode = st.checkbox("🧪 Mode diagnostic", value=True)
 
-colL, colR = st.columns([0.45, 0.55], gap="large")
+left, right = st.columns([0.42, 0.58], gap="large")
 
-with colL:
-    st.subheader("1) Choisir la commune")
-    q = st.text_input("Nom de commune", value="Dinan")
-    if not q.strip():
+with left:
+    st.subheader("1) Point + rayon")
+    q = st.text_input("Adresse / code postal / ville", value="")
+    radius_km = st.slider("Rayon (km)", 1, 80, 15, 1)
+
+    if st.button("🔎 Rechercher"):
+        if not q.strip():
+            st.warning("Entre une adresse/ville.")
+        else:
+            try:
+                results = geocode_search(q.strip(), limit=8)
+                st.session_state["geo_results"] = results
+            except Exception as e:
+                st.error(f"Géocodage KO : {e}")
+
+    results = st.session_state.get("geo_results", [])
+    if not results:
+        st.info("➡️ Tape une ville/adresse puis clique Rechercher.")
         st.stop()
 
-    communes = []
-    try:
-        with st.spinner("Recherche commune..."):
-            communes = search_communes(q.strip())
-    except Exception as e:
-        st.error(f"Erreur geo.api.gouv.fr : {e}")
+    idx = st.selectbox("Choisir le point", list(range(len(results))), format_func=lambda i: results[i]["label"])
+    center = results[idx]
+
+    st.caption(f"Centre: {center['label']} (lat={center['lat']:.5f}, lon={center['lon']:.5f})")
+
+    if st.button("📍 Charger communes du rayon"):
+        try:
+            com = geo_commune_by_latlon(center["lat"], center["lon"])
+            if not com:
+                raise RuntimeError("Commune introuvable à partir du point.")
+            dept = com["codeDepartement"]
+            df_communes = geo_communes_dept(dept)
+
+            df_communes["dist_km"] = df_communes.apply(
+                lambda r: haversine_km(center["lat"], center["lon"], r["lat"], r["lon"]), axis=1
+            )
+            in_radius = df_communes[df_communes["dist_km"] <= radius_km].copy()
+            in_radius = in_radius.sort_values(["dist_km", "population_geoapi"], ascending=[True, False])
+            st.session_state["in_radius"] = in_radius
+        except Exception as e:
+            st.error(f"Erreur communes : {e}")
+
+    in_radius = st.session_state.get("in_radius", None)
+    if in_radius is None:
+        st.info("➡️ Clique 'Charger communes du rayon'.")
         st.stop()
 
-    if not communes:
-        st.warning("Aucune commune trouvée.")
-        st.stop()
+    st.write(f"Communes dans {radius_km} km : **{len(in_radius):,}**")
 
-    options = {f"{c['nom']} ({c['code']})": c["code"] for c in communes}
-    label = st.selectbox("Sélection", list(options.keys()))
-    code_insee = options[label]
-    st.success(f"Commune sélectionnée : {label}")
+    if "selected_codes" not in st.session_state:
+        st.session_state["selected_codes"] = set()
 
-    st.subheader("2) Télécharger + lire le fichier âges")
-    run = st.button("📦 Charger les données âges (brut)")
+    view = in_radius[["code_insee", "nom", "codes_postaux", "code_dept", "population_geoapi", "dist_km"]].copy()
+    view["ajouter"] = view["code_insee"].isin(st.session_state["selected_codes"])
 
-    show_diag = st.checkbox("Afficher le diagnostic détaillé", value=True)
-
-with colR:
-    st.subheader("Résultat")
-
-    if not run:
-        st.info("Clique **Charger les données âges** pour lancer le téléchargement/lecture (une seule fois puis cache).")
-        st.stop()
-
-    # 1) download (cached)
-    try:
-        path, diag = download_to_cache(AGE_URL, filename="ages_communes.xlsx", max_age_days=120)
-    except Exception as e:
-        st.error("Échec téléchargement.")
-        st.exception(e)
-        st.stop()
-
-    if show_diag:
-        st.markdown("### Diagnostic téléchargement / cache")
-        st.json(diag)
-
-    # 2) read (cached)
-    try:
-        df = load_age_xlsx(str(path))
-    except Exception as e:
-        st.error("Téléchargement OK mais lecture Excel KO (format inattendu ou fichier non-xlsx).")
-        st.exception(e)
-        # petit indice utile
-        st.write("Astuce: regarde `content_type` dans le diagnostic, si c’est du HTML/JSON au lieu d’un XLSX.")
-        st.stop()
-
-    # 3) detect code column + filter
-    code_col = detect_code_insee_column(df)
-    df[code_col] = df[code_col].astype(str).str.zfill(5)
-
-    out = df[df[code_col] == code_insee].copy()
-
-    st.markdown("### Données brutes (ligne(s) de la commune)")
-    st.caption(f"Colonne code INSEE détectée : `{code_col}` | lignes trouvées : {len(out)}")
-    st.dataframe(out, width="stretch", height=420)
-
-    if len(out) == 0:
-        st.warning(
-            "Aucune ligne trouvée pour ce code INSEE dans le fichier.\n"
-            "Ca arrive si le fichier n’est pas au niveau 'communes' (ou si la colonne code n’est pas détectée correctement)."
-        )
-
-    # 4) export brut
-    st.download_button(
-        "⬇️ Télécharger CSV (brut) pour cette commune",
-        data=out.to_csv(index=False).encode("utf-8"),
-        file_name=f"ages_brut_{code_insee}.csv",
-        mime="text/csv",
+    edited = st.data_editor(
+        view,
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "ajouter": st.column_config.CheckboxColumn("Ajouter"),
+            "dist_km": st.column_config.NumberColumn("Distance (km)", format="%.1f"),
+        },
+        disabled=["code_insee", "nom", "codes_postaux", "code_dept", "population_geoapi", "dist_km"],
+        key="editor_communes",
+    )
+    st.session_state["selected_codes"] = set(
+        edited.loc[edited["ajouter"] == True, "code_insee"].astype(str).tolist()
     )
 
-    # 5) aperçu colonnes (utile pour comprendre le fichier)
-    with st.expander("Voir les colonnes du fichier (pour debug)", expanded=False):
-        st.write(df.columns.tolist())
+    st.info(f"Communes sélectionnées : **{len(st.session_state['selected_codes'])}**")
+
+    st.subheader("2) Upload fichier INSEE âges (XLSX/CSV)")
+    age_file = st.file_uploader("Fichier âges (communes)", type=["xlsx", "xls", "csv"])
+
+with right:
+    st.subheader("Carte")
+    m = folium.Map(location=[center["lat"], center["lon"]], zoom_start=10, control_scale=True)
+    folium.Marker([center["lat"], center["lon"]], tooltip="Centre", popup=center["label"]).add_to(m)
+    folium.Circle([center["lat"], center["lon"]], radius=radius_km * 1000, fill=False).add_to(m)
+
+    sample = in_radius.head(250)
+    for _, r in sample.iterrows():
+        folium.CircleMarker([r["lat"], r["lon"]], radius=4, tooltip=f"{r['nom']} ({r['code_insee']})").add_to(m)
+
+    st_folium(m, width="stretch", height=420)
+
+    sel = sorted(list(st.session_state["selected_codes"]))
+    if not sel:
+        st.warning("Sélectionne au moins une commune.")
+        st.stop()
+
+    st.subheader("Analyses âges (depuis upload)")
+    if age_file is None:
+        st.info("➡️ Upload ton fichier INSEE âges pour continuer.")
+        st.stop()
+
+    # Lecture fichier
+    try:
+        t0 = time.time()
+        if age_file.name.lower().endswith(".csv"):
+            df_age = pd.read_csv(age_file)
+            read_diag = {"format": "csv", "seconds": round(time.time() - t0, 2), "rows": df_age.shape[0], "cols": df_age.shape[1]}
+        else:
+            file_bytes = age_file.getvalue()
+            df_age, read_diag = read_uploaded_excel_bytes(file_bytes)
+            read_diag["format"] = "excel"
+            read_diag["size_mb"] = round(len(file_bytes) / (1024 * 1024), 2)
+    except Exception as e:
+        st.error("Impossible de lire le fichier uploadé.")
+        st.exception(e)
+        st.stop()
+
+    # Détection colonnes
+    code_col = detect_code_insee_column(df_age.columns.tolist())
+    age_cols = detect_age_columns(df_age.columns.tolist())
+
+    if diag_mode:
+        st.markdown("### Diagnostic fichier")
+        st.json({
+            "filename": age_file.name,
+            **read_diag,
+            "detected_code_col": code_col,
+            "nb_age_columns_detected": len(age_cols),
+            "age_columns_sample": [str(c) for c in age_cols[:20]],
+        })
+
+    if code_col is None:
+        st.error("Je ne trouve pas la colonne code INSEE dans ton fichier. (ex: CODGEO / Code géographique / INSEE...)")
+        st.write("Colonnes détectées :")
+        st.write(df_age.columns.tolist())
+        st.stop()
+
+    if len(age_cols) < 5:
+        st.error("Je ne détecte pas les colonnes d'âges (ex: '0-4', '5-9', '95+').")
+        st.write("Colonnes détectées :")
+        st.write(df_age.columns.tolist())
+        st.stop()
+
+    # Filtrage sur communes sélectionnées
+    df_age[code_col] = df_age[code_col].astype(str).str.zfill(5)
+    df_zone = df_age[df_age[code_col].isin(sel)].copy()
+
+    st.markdown("### Données brutes filtrées (zone)")
+    st.caption(f"Lignes trouvées : {len(df_zone)} / communes sélectionnées : {len(sel)}")
+    st.dataframe(df_zone.head(200), width="stretch", height=260)
+
+    missing = sorted(list(set(sel) - set(df_zone[code_col].unique().tolist())))
+    if missing and diag_mode:
+        st.warning(f"Codes INSEE manquants dans le fichier (extrait) : {missing[:25]}")
+
+    # Agrégation zone : structure d'âge + âge moyen approx
+    st.markdown("### Indicateurs zone")
+    # somme des colonnes âge (toutes communes)
+    sums = df_zone[age_cols].applymap(safe_int).sum(axis=0, numeric_only=False)
+    row_sums = sums.to_dict()
+    # construire une "ligne" virtuelle pour réutiliser fonctions
+    pseudo_row = pd.Series(row_sums)
+
+    buckets = age_buckets_from_row(pseudo_row, age_cols)
+    mean_age = approx_mean_age_from_row(pseudo_row, age_cols)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Structure par grands groupes**")
+        st.dataframe(buckets, width="stretch", hide_index=True)
+    with c2:
+        st.markdown("**Âge moyen approximatif (zone)**")
+        st.metric("Âge moyen approx", f"{mean_age:.1f} ans" if mean_age is not None else "N/A")
+
+    st.download_button(
+        "⬇️ Télécharger CSV brut (zone filtrée)",
+        data=df_zone.to_csv(index=False).encode("utf-8"),
+        file_name="ages_zone_brut.csv",
+        mime="text/csv",
+    )
