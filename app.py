@@ -56,14 +56,11 @@ def extract_insee_5digits(value: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def sort_years(values: List[str]) -> List[str]:
-    # tente tri numérique sinon lexicographique
-    def key(v):
-        try:
-            return int(v)
-        except Exception:
-            return v
-    return sorted(values, key=key)
+def sort_years(vals: List[str]) -> List[str]:
+    def k(v):
+        s = str(v)
+        return int(s) if s.isdigit() else s
+    return sorted([str(v) for v in vals], key=k)
 
 
 # =========================
@@ -180,21 +177,14 @@ def geo_communes_dept(code_dept: str) -> pd.DataFrame:
 def guess_concordance_columns(cols: List[str]) -> Tuple[Optional[str], Optional[str]]:
     lower = {c: str(c).lower() for c in cols}
     geo_candidates, insee_candidates = [], []
-
     for c, cl in lower.items():
         if cl.strip() in {"geo", "id_geo", "geo_code", "code_geo"}:
             geo_candidates.append(c)
-        if "geo" in cl and "object" not in cl and "measure" not in cl and cl != "age":
-            geo_candidates.append(c)
-
         if cl.strip() in {"codgeo", "code_insee", "insee"}:
             insee_candidates.append(c)
         if ("insee" in cl and "code" in cl) or ("code" in cl and ("geo" in cl or "géo" in cl)):
             insee_candidates.append(c)
-
-    geo_col = geo_candidates[0] if geo_candidates else None
-    insee_col = insee_candidates[0] if insee_candidates else None
-    return geo_col, insee_col
+    return (geo_candidates[0] if geo_candidates else None, insee_candidates[0] if insee_candidates else None)
 
 
 def build_geo_to_insee_map(df_conc: pd.DataFrame, geo_col: str, insee_col: str) -> Dict[str, str]:
@@ -206,7 +196,7 @@ def build_geo_to_insee_map(df_conc: pd.DataFrame, geo_col: str, insee_col: str) 
 
 
 # =========================
-# Age parsing + buckets
+# AGE -> bucket
 # =========================
 def parse_age_value(age_val: str) -> Tuple[Optional[float], Optional[float]]:
     if age_val is None:
@@ -214,15 +204,15 @@ def parse_age_value(age_val: str) -> Tuple[Optional[float], Optional[float]]:
     s = str(age_val).strip()
 
     if "-" in s:
-        parts = s.split("-")
         try:
-            return float(parts[0]), float(parts[1])
+            a, b = s.split("-")
+            return float(a), float(b)
         except Exception:
             pass
 
     if s.endswith("+"):
         try:
-            return float(s.replace("+", "")), None
+            return float(s[:-1]), None
         except Exception:
             pass
 
@@ -230,7 +220,6 @@ def parse_age_value(age_val: str) -> Tuple[Optional[float], Optional[float]]:
         a = float(s)
         return a, a
 
-    # SDMX-ish
     m = re.search(r"(\d{1,3})\s*T\s*(\d{1,3})", s.replace(" ", ""))
     if m:
         return float(m.group(1)), float(m.group(2))
@@ -239,18 +228,12 @@ def parse_age_value(age_val: str) -> Tuple[Optional[float], Optional[float]]:
     if m:
         return float(m.group(1)), None
 
-    m = re.search(r"LT(\d{1,3})", s)
-    if m:
-        b = float(m.group(1)) - 1
-        return 0.0, b
-
     nums = re.findall(r"\d{1,3}", s)
     if len(nums) == 1:
         a = float(nums[0])
         return a, a
     if len(nums) >= 2:
-        a = float(nums[0])
-        b = float(nums[1])
+        a, b = float(nums[0]), float(nums[1])
         if a <= b:
             return a, b
 
@@ -284,30 +267,25 @@ def bucket_from_mid(mid: Optional[float]) -> str:
 
 
 @st.cache_data(show_spinner=False)
-def build_age_bucket_map(age_values: List[str]) -> Dict[str, str]:
-    """
-    Mappe chaque modalité AGE -> bucket (0-14, 15-29, ...) une seule fois.
-    """
-    out = {}
+def build_age_maps(age_values: List[str]) -> Tuple[Dict[str, str], Dict[str, float]]:
+    bucket_map = {}
+    mid_map = {}
     for a in age_values:
         amin, amax = parse_age_value(a)
         mid = age_midpoint(amin, amax)
-        out[a] = bucket_from_mid(mid)
-    return out
+        bucket_map[a] = bucket_from_mid(mid)
+        if mid is not None and not (isinstance(mid, float) and np.isnan(mid)):
+            mid_map[a] = float(mid)
+    return bucket_map, mid_map
 
 
-def normalize_codes_from_age_df(
-    df_age: pd.DataFrame,
-    geo_col: str,
-    geo_to_insee: Optional[Dict[str, str]] = None,
-) -> pd.DataFrame:
+def normalize_codes(df_age: pd.DataFrame, geo_to_insee: Optional[Dict[str, str]]) -> pd.DataFrame:
     out = df_age.copy()
-    out[geo_col] = out[geo_col].astype(str)
-
+    out["GEO"] = out["GEO"].astype(str)
     if geo_to_insee:
-        out["CODE_INSEE"] = out[geo_col].map(geo_to_insee)
+        out["CODE_INSEE"] = out["GEO"].map(geo_to_insee)
     else:
-        out["CODE_INSEE"] = out[geo_col].apply(extract_insee_5digits)
+        out["CODE_INSEE"] = out["GEO"].apply(extract_insee_5digits)
     return out
 
 
@@ -317,38 +295,31 @@ def apply_sex_filter(df: pd.DataFrame, sex_mode: str) -> pd.DataFrame:
     d = df.copy()
     d["SEX"] = d["SEX"].astype(str)
 
-    if sex_mode == "Somme (tous sexes présents)":
-        return d
-
     if sex_mode == "Total seulement (T si présent)":
         if (d["SEX"] == "T").any():
             return d[d["SEX"] == "T"]
-        return d  # fallback: si pas de T, on garde tout (ça peut être déjà total)
-
+        return d
     if sex_mode == "Hommes seulement (M si présent)":
         if (d["SEX"] == "M").any():
             return d[d["SEX"] == "M"]
         return d
-
     if sex_mode == "Femmes seulement (F si présent)":
         if (d["SEX"] == "F").any():
             return d[d["SEX"] == "F"]
         return d
+    return d  # Somme
 
-    return d
 
-
-def compute_population_timeseries(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    df attendu: colonnes CODE_INSEE, TIME_PERIOD, AGE, OBS_VALUE (+ éventuellement SEX déjà filtré)
-    Retour: DataFrame long avec CODE_INSEE, TIME_PERIOD, population
-    """
-    d = df.copy()
+# =========================
+# Timeseries
+# =========================
+def pop_timeseries_by_commune(df_zone: pd.DataFrame) -> pd.DataFrame:
+    d = df_zone.copy()
     d["TIME_PERIOD"] = d["TIME_PERIOD"].astype(str)
     d["OBS_VALUE"] = pd.to_numeric(d["OBS_VALUE"], errors="coerce").fillna(0.0)
 
     pop = (
-        d.groupby(["CODE_INSEE", "TIME_PERIOD"], as_index=False)["OBS_VALUE"]
+        d.groupby(["TIME_PERIOD", "CODE_INSEE"], as_index=False)["OBS_VALUE"]
         .sum()
         .rename(columns={"OBS_VALUE": "population"})
     )
@@ -356,15 +327,10 @@ def compute_population_timeseries(df: pd.DataFrame) -> pd.DataFrame:
     return pop
 
 
-def compute_bucket_timeseries_zone(df: pd.DataFrame, bucket_map: Dict[str, str]) -> pd.DataFrame:
-    """
-    df attendu filtré sur communes + SEX selon mode.
-    Retour: pivot index TIME_PERIOD, colonnes buckets, valeurs effectifs zone.
-    """
-    d = df.copy()
+def bucket_timeseries_zone(df_zone: pd.DataFrame, bucket_map: Dict[str, str]) -> pd.DataFrame:
+    d = df_zone.copy()
     d["TIME_PERIOD"] = d["TIME_PERIOD"].astype(str)
     d["OBS_VALUE"] = pd.to_numeric(d["OBS_VALUE"], errors="coerce").fillna(0.0)
-
     d["bucket"] = d["AGE"].astype(str).map(bucket_map).fillna("Inconnu")
 
     g = (
@@ -379,40 +345,55 @@ def compute_bucket_timeseries_zone(df: pd.DataFrame, bucket_map: Dict[str, str])
     return pivot
 
 
+def mean_age_timeseries_zone(df_zone: pd.DataFrame, mid_map: Dict[str, float]) -> pd.Series:
+    d = df_zone.copy()
+    d["TIME_PERIOD"] = d["TIME_PERIOD"].astype(str)
+    d["OBS_VALUE"] = pd.to_numeric(d["OBS_VALUE"], errors="coerce").fillna(0.0)
+    d["AGE"] = d["AGE"].astype(str)
+
+    d["age_mid"] = d["AGE"].map(mid_map)
+    d = d.dropna(subset=["age_mid"])
+
+    # moyenne pondérée par année (vectorisée)
+    d["w"] = d["age_mid"] * d["OBS_VALUE"]
+    g = d.groupby("TIME_PERIOD", as_index=True).agg(num=("w", "sum"), den=("OBS_VALUE", "sum"))
+    g["age_moyen_approx"] = g["num"] / g["den"].replace(0, np.nan)
+    g = g.dropna(subset=["age_moyen_approx"])
+    g = g.loc[sort_years(g.index.tolist())]
+    return g["age_moyen_approx"]
+
+
 # =========================
-# UI
+# APP UI (wrapped in try for in-app error display)
 # =========================
-st.title("Zone de chalandise (carte + rayon) + Évolutions population & âges (upload INSEE)")
+try:
+    st.title("Zone de chalandise + évolutions population & tranches d’âge (INSEE upload)")
 
-diag_mode = st.checkbox("🧪 Mode diagnostic", value=True)
+    diag_mode = st.checkbox("🧪 Mode diagnostic", value=True)
 
-left, right = st.columns([0.42, 0.58], gap="large")
+    left, right = st.columns([0.42, 0.58], gap="large")
 
-with left:
-    st.subheader("1) Point + rayon")
-    q = st.text_input("Adresse / code postal / ville", value="")
-    radius_km = st.slider("Rayon (km)", 1, 80, 15, 1)
+    with left:
+        st.subheader("1) Point + rayon")
+        q = st.text_input("Adresse / code postal / ville", value="")
+        radius_km = st.slider("Rayon (km)", 1, 80, 15, 1)
 
-    if st.button("🔎 Rechercher le point"):
-        if not q.strip():
-            st.warning("Entre une adresse/ville.")
-        else:
-            try:
+        if st.button("🔎 Rechercher le point"):
+            if not q.strip():
+                st.warning("Entre une adresse/ville.")
+            else:
                 st.session_state["geo_results"] = geocode_search(q.strip(), limit=8)
-            except Exception as e:
-                st.error(f"Géocodage KO : {e}")
 
-    results = st.session_state.get("geo_results", [])
-    if not results:
-        st.info("➡️ Tape une ville/adresse puis clique **Rechercher le point**.")
-        st.stop()
+        results = st.session_state.get("geo_results", [])
+        if not results:
+            st.info("➡️ Tape une ville/adresse puis clique **Rechercher le point**.")
+            st.stop()
 
-    idx = st.selectbox("Choisir le point", list(range(len(results))), format_func=lambda i: results[i]["label"])
-    center = results[idx]
-    st.caption(f"Centre: {center['label']} (lat={center['lat']:.5f}, lon={center['lon']:.5f})")
+        idx = st.selectbox("Choisir le point", list(range(len(results))), format_func=lambda i: results[i]["label"])
+        center = results[idx]
+        st.caption(f"Centre: {center['label']} (lat={center['lat']:.5f}, lon={center['lon']:.5f})")
 
-    if st.button("📍 Charger communes du rayon"):
-        try:
+        if st.button("📍 Charger communes du rayon"):
             com = geo_commune_by_latlon(center["lat"], center["lon"])
             if not com:
                 raise RuntimeError("Commune introuvable à partir du point.")
@@ -425,110 +406,107 @@ with left:
             in_radius = df_communes[df_communes["dist_km"] <= radius_km].copy()
             in_radius = in_radius.sort_values(["dist_km", "population_geoapi"], ascending=[True, False])
             st.session_state["in_radius"] = in_radius
-        except Exception as e:
-            st.error(f"Erreur communes : {e}")
 
-    in_radius = st.session_state.get("in_radius", None)
-    if in_radius is None:
-        st.info("➡️ Clique **Charger communes du rayon**.")
-        st.stop()
+        in_radius = st.session_state.get("in_radius", None)
+        if in_radius is None:
+            st.info("➡️ Clique **Charger communes du rayon**.")
+            st.stop()
 
-    st.write(f"Communes dans {radius_km} km : **{len(in_radius):,}**")
+        st.write(f"Communes dans {radius_km} km : **{len(in_radius):,}**")
 
-    if "selected_codes" not in st.session_state:
-        st.session_state["selected_codes"] = set()
+        if "selected_codes" not in st.session_state:
+            st.session_state["selected_codes"] = set()
 
-    view = in_radius[["code_insee", "nom", "codes_postaux", "code_dept", "population_geoapi", "dist_km"]].copy()
-    view["ajouter"] = view["code_insee"].isin(st.session_state["selected_codes"])
+        view = in_radius[["code_insee", "nom", "codes_postaux", "code_dept", "population_geoapi", "dist_km"]].copy()
+        view["ajouter"] = view["code_insee"].isin(st.session_state["selected_codes"])
 
-    edited = st.data_editor(
-        view,
-        hide_index=True,
-        width="stretch",
-        column_config={
-            "ajouter": st.column_config.CheckboxColumn("Ajouter"),
-            "dist_km": st.column_config.NumberColumn("Distance (km)", format="%.1f"),
-        },
-        disabled=["code_insee", "nom", "codes_postaux", "code_dept", "population_geoapi", "dist_km"],
-        key="editor_communes",
-    )
-    st.session_state["selected_codes"] = set(
-        edited.loc[edited["ajouter"] == True, "code_insee"].astype(str).tolist()
-    )
-    st.info(f"Communes sélectionnées : **{len(st.session_state['selected_codes'])}**")
+        edited = st.data_editor(
+            view,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "ajouter": st.column_config.CheckboxColumn("Ajouter"),
+                "dist_km": st.column_config.NumberColumn("Distance (km)", format="%.1f"),
+            },
+            disabled=["code_insee", "nom", "codes_postaux", "code_dept", "population_geoapi", "dist_km"],
+            key="editor_communes",
+        )
+        st.session_state["selected_codes"] = set(
+            edited.loc[edited["ajouter"] == True, "code_insee"].astype(str).tolist()
+        )
+        st.info(f"Communes sélectionnées : **{len(st.session_state['selected_codes'])}**")
 
-    st.subheader("2) Upload fichiers INSEE")
-    age_file = st.file_uploader("Fichier âges (CSV INSEE : AGE;GEO;...;OBS_VALUE)", type=["csv"])
-    conc_file = st.file_uploader("Fichier de concordance (optionnel, CSV)", type=["csv"])
+        st.subheader("2) Upload fichiers INSEE")
+        age_file = st.file_uploader("Fichier âges (CSV INSEE : AGE;GEO;TIME_PERIOD;OBS_VALUE...)", type=["csv"])
+        conc_file = st.file_uploader("Fichier de concordance (optionnel, CSV)", type=["csv"])
 
-with right:
-    st.subheader("Carte")
-    m = folium.Map(location=[center["lat"], center["lon"]], zoom_start=10, control_scale=True)
-    folium.Marker([center["lat"], center["lon"]], tooltip="Centre", popup=center["label"]).add_to(m)
-    folium.Circle([center["lat"], center["lon"]], radius=radius_km * 1000, fill=False).add_to(m)
+    with right:
+        st.subheader("Carte")
+        m = folium.Map(location=[center["lat"], center["lon"]], zoom_start=10, control_scale=True)
+        folium.Marker([center["lat"], center["lon"]], tooltip="Centre", popup=center["label"]).add_to(m)
+        folium.Circle([center["lat"], center["lon"]], radius=radius_km * 1000, fill=False).add_to(m)
 
-    sample = in_radius.head(250)
-    for _, r in sample.iterrows():
-        folium.CircleMarker([r["lat"], r["lon"]], radius=4, tooltip=f"{r['nom']} ({r['code_insee']})").add_to(m)
+        sample = in_radius.head(250)
+        for _, r in sample.iterrows():
+            folium.CircleMarker([r["lat"], r["lon"]], radius=4, tooltip=f"{r['nom']} ({r['code_insee']})").add_to(m)
 
-    st_folium(m, width="stretch", height=420)
+        st_folium(m, width="stretch", height=420)
 
-    sel = sorted(list(st.session_state["selected_codes"]))
-    if not sel:
-        st.warning("Sélectionne au moins une commune.")
-        st.stop()
+        sel = sorted(list(st.session_state["selected_codes"]))
+        if not sel:
+            st.warning("Sélectionne au moins une commune.")
+            st.stop()
 
-    # map INSEE -> Nom (pour les courbes)
-    name_map = dict(zip(in_radius["code_insee"].astype(str).tolist(), in_radius["nom"].astype(str).tolist()))
+        if age_file is None:
+            st.info("➡️ Upload ton fichier âges CSV pour continuer.")
+            st.stop()
 
-    st.subheader("Analyses (évolutions)")
-    if age_file is None:
-        st.info("➡️ Upload ton fichier âges CSV pour continuer.")
-        st.stop()
-
-    # Read age CSV
-    try:
-        with st.spinner("Lecture du fichier âges (peut être long)..."):
-            age_bytes = age_file.getvalue()
-            df_age_raw, age_diag = read_uploaded_csv_smart(age_bytes)
-    except Exception as e:
-        st.error("Impossible de lire le CSV âges.")
-        st.exception(e)
-        st.stop()
-
-    # Keep only needed columns asap
-    needed = [c for c in ["AGE", "GEO", "TIME_PERIOD", "SEX", "OBS_VALUE"] if c in df_age_raw.columns]
-    df_age = df_age_raw[needed].copy()
-    del df_age_raw
-
-    if diag_mode:
-        st.markdown("### Diagnostic lecture")
-        st.json(
-            {
-                "filename": age_file.name,
-                "size_mb": age_diag.get("size_mb"),
-                "sep_used": age_diag.get("sep_used"),
-                "encoding_used": age_diag.get("encoding_used"),
-                "seconds": age_diag.get("seconds"),
-                "rows": age_diag.get("rows"),
-                "cols": age_diag.get("cols"),
-                "kept_columns": needed,
-            }
+        # ---- controls to avoid chart overload
+        st.subheader("Paramètres des graphiques")
+        top_n = st.slider("Nombre max de communes affichées (Graph 1)", 3, 60, 15, 1)
+        sex_mode = st.selectbox(
+            "Sexe (si colonne SEX présente)",
+            options=[
+                "Total seulement (T si présent)",
+                "Somme (tous sexes présents)",
+                "Hommes seulement (M si présent)",
+                "Femmes seulement (F si présent)",
+            ],
+            index=0,
         )
 
-    if "GEO" not in df_age.columns:
-        st.error("Colonne `GEO` absente du fichier.")
-        st.write("Colonnes:", df_age.columns.tolist())
-        st.stop()
+        # ---- read age CSV
+        with st.spinner("Lecture du fichier âges (peut être long)..."):
+            age_bytes = age_file.getvalue()
+            df_raw, age_diag = read_uploaded_csv_smart(age_bytes)
 
-    # Optional concordance
-    geo_to_insee = None
-    if conc_file is not None:
-        try:
-            with st.spinner("Lecture concordance..."):
-                conc_bytes = conc_file.getvalue()
-                df_conc, conc_diag = read_uploaded_csv_smart(conc_bytes)
+        needed = [c for c in ["AGE", "GEO", "TIME_PERIOD", "SEX", "OBS_VALUE"] if c in df_raw.columns]
+        df = df_raw[needed].copy()
+        del df_raw
 
+        if "AGE" not in df.columns or "GEO" not in df.columns or "TIME_PERIOD" not in df.columns or "OBS_VALUE" not in df.columns:
+            raise RuntimeError(f"Colonnes nécessaires absentes. Colonnes trouvées: {df.columns.tolist()}")
+
+        if diag_mode:
+            st.markdown("### Diagnostic lecture")
+            st.json(
+                {
+                    "filename": age_file.name,
+                    "size_mb": age_diag.get("size_mb"),
+                    "sep_used": age_diag.get("sep_used"),
+                    "encoding_used": age_diag.get("encoding_used"),
+                    "seconds": age_diag.get("seconds"),
+                    "rows": age_diag.get("rows"),
+                    "cols": age_diag.get("cols"),
+                    "kept_columns": needed,
+                }
+            )
+
+        # ---- optional concordance
+        geo_to_insee = None
+        if conc_file is not None:
+            conc_bytes = conc_file.getvalue()
+            df_conc, conc_diag = read_uploaded_csv_smart(conc_bytes)
             geo_guess, insee_guess = guess_concordance_columns(df_conc.columns.tolist())
 
             st.markdown("### Concordance (optionnelle)")
@@ -543,157 +521,121 @@ with right:
                 index=(df_conc.columns.tolist().index(insee_guess) if insee_guess in df_conc.columns else 0),
             )
 
-            if st.button("Construire la table de concordance"):
+            if st.button("Construire / actualiser la concordance"):
                 geo_to_insee = build_geo_to_insee_map(df_conc, geo_col_conc, insee_col_conc)
                 st.session_state["geo_to_insee"] = geo_to_insee
+
+            if "geo_to_insee" in st.session_state:
+                geo_to_insee = st.session_state["geo_to_insee"]
 
             if diag_mode:
                 st.json(
                     {
-                        "filename": conc_file.name,
-                        "sep_used": conc_diag.get("sep_used"),
-                        "encoding_used": conc_diag.get("encoding_used"),
-                        "rows": conc_diag.get("rows"),
-                        "cols": conc_diag.get("cols"),
+                        "conc_rows": conc_diag.get("rows"),
+                        "conc_cols": conc_diag.get("cols"),
+                        "conc_sep": conc_diag.get("sep_used"),
+                        "conc_encoding": conc_diag.get("encoding_used"),
                     }
                 )
-        except Exception as e:
-            st.warning("Concordance uploadée mais non exploitable (on continue sans).")
-            if diag_mode:
-                st.exception(e)
 
-    if "geo_to_insee" in st.session_state:
-        geo_to_insee = st.session_state["geo_to_insee"]
+        # ---- normalize codes + filter zone early
+        df = normalize_codes(df, geo_to_insee)
+        mapped_ok = float(df["CODE_INSEE"].notna().mean()) if len(df) else 0.0
+        if diag_mode:
+            st.markdown("### Diagnostic mapping GEO → CODE_INSEE")
+            st.write(f"Taux de lignes avec CODE_INSEE: **{mapped_ok*100:.1f}%**")
+            st.dataframe(df[["GEO", "CODE_INSEE"]].dropna().head(20), width="stretch", height=220)
 
-    # Normalize CODE_INSEE
-    with st.spinner("Préparation des codes communes..."):
-        df_age2 = normalize_codes_from_age_df(df_age, geo_col="GEO", geo_to_insee=geo_to_insee)
+        df_zone = df[df["CODE_INSEE"].isin(sel)].copy()
+        if df_zone.empty:
+            raise RuntimeError("Après mapping + filtrage zone, aucune ligne ne correspond aux communes sélectionnées.")
 
-    mapped_ok = float(df_age2["CODE_INSEE"].notna().mean()) if len(df_age2) else 0.0
-    if diag_mode:
-        st.markdown("### Diagnostic mapping GEO → CODE_INSEE")
-        st.write(f"Taux de lignes avec CODE_INSEE détecté: **{mapped_ok*100:.1f}%**")
-        st.dataframe(df_age2[["GEO", "CODE_INSEE"]].dropna().head(20), width="stretch", height=220)
+        df_zone = apply_sex_filter(df_zone, sex_mode)
 
-    if mapped_ok < 0.5:
-        st.warning(
-            "Le mapping GEO → code INSEE marche mal (<50%). "
-            "Le fichier de concordance est probablement nécessaire."
+        years = sort_years(df_zone["TIME_PERIOD"].dropna().astype(str).unique().tolist())
+        if not years:
+            raise RuntimeError("Aucune année TIME_PERIOD exploitable après filtrage zone.")
+        st.caption(f"Années disponibles (zone) : {years[0]} → {years[-1]} ({len(years)} points)")
+
+        # ---- maps AGE -> bucket & midpoint (built on zone unique AGE to be fast)
+        age_values = df_zone["AGE"].dropna().astype(str).unique().tolist()
+        bucket_map, mid_map = build_age_maps(age_values)
+
+        # ---- name map for legends
+        name_map = dict(zip(in_radius["code_insee"].astype(str).tolist(), in_radius["nom"].astype(str).tolist()))
+
+        # =========================================================
+        # GRAPH 1: Population by commune + total zone
+        # =========================================================
+        st.markdown("## 1) Évolution de la population (communes + total zone)")
+
+        pop_long = pop_timeseries_by_commune(df_zone)
+
+        # select top N communes by latest year population
+        latest_year = years[-1]
+        latest = pop_long[pop_long["TIME_PERIOD"] == latest_year].copy()
+        top_codes = (
+            latest.groupby("CODE_INSEE")["population"]
+            .sum()
+            .sort_values(ascending=False)
+            .head(top_n)
+            .index.astype(str)
+            .tolist()
         )
 
-    # Filter to selected communes early (big perf win)
-    with st.spinner("Filtrage sur la zone sélectionnée..."):
-        df_zone = df_age2[df_age2["CODE_INSEE"].isin(sel)].copy()
+        pop_long_top = pop_long[pop_long["CODE_INSEE"].astype(str).isin(top_codes)].copy()
 
-    if df_zone.empty:
-        st.error("Aucune ligne du fichier âges ne correspond aux communes sélectionnées (après mapping).")
-        st.stop()
+        pop_pivot = pop_long_top.pivot(index="TIME_PERIOD", columns="CODE_INSEE", values="population").fillna(0).astype(int)
+        pop_pivot = pop_pivot.loc[sort_years(pop_pivot.index.tolist())]
 
-    # Sex mode
-    sex_mode = st.selectbox(
-        "Sexe (si colonne SEX présente)",
-        options=[
-            "Total seulement (T si présent)",
-            "Somme (tous sexes présents)",
-            "Hommes seulement (M si présent)",
-            "Femmes seulement (F si présent)",
-        ],
-        index=0,
-    )
-    df_zone = apply_sex_filter(df_zone, sex_mode)
+        # rename columns (avoid duplicates)
+        newcols = {}
+        used = set()
+        for code in pop_pivot.columns.astype(str).tolist():
+            nom = name_map.get(code, code)
+            label = f"{nom} ({code})"
+            if label in used:
+                label = f"{label}*"
+            used.add(label)
+            newcols[code] = label
+        pop_pivot.columns = [newcols.get(str(c), str(c)) for c in pop_pivot.columns]
 
-    # Available years
-    if "TIME_PERIOD" not in df_zone.columns:
-        st.error("Colonne TIME_PERIOD absente du fichier.")
-        st.stop()
+        # total zone = sum all communes selected (not only top N)
+        pop_total_zone = pop_long.groupby("TIME_PERIOD")["population"].sum()
+        pop_total_zone = pop_total_zone.loc[sort_years(pop_total_zone.index.tolist())]
+        pop_pivot["TOTAL ZONE"] = pop_total_zone.reindex(pop_pivot.index).fillna(0).astype(int)
 
-    years = sort_years(df_zone["TIME_PERIOD"].dropna().astype(str).unique().tolist())
-    if not years:
-        st.error("Aucune année (TIME_PERIOD) exploitable.")
-        st.stop()
+        st.line_chart(pop_pivot)
 
-    st.caption(f"Années disponibles (zone) : {years[0]} → {years[-1]} ({len(years)} points)")
+        st.download_button(
+            "⬇️ Télécharger CSV - population (TOP communes + total zone)",
+            data=pop_pivot.reset_index().to_csv(index=False).encode("utf-8"),
+            file_name="population_zone_timeseries_topN.csv",
+            mime="text/csv",
+        )
 
-    # Build AGE bucket map once (on unique AGE in zone)
-    with st.spinner("Préparation des tranches d'âge..."):
-        age_values = df_zone["AGE"].dropna().astype(str).unique().tolist()
-        bucket_map = build_age_bucket_map(age_values)
+        # =========================================================
+        # GRAPH 2: Age buckets evolution for zone
+        # =========================================================
+        st.markdown("## 2) Évolution de la population par tranches d’âge (zone)")
 
-    # -----------------------------
-    # 1) Évolution population: par commune + total zone
-    # -----------------------------
-    st.markdown("## 1) Évolution de la population (communes + total zone)")
+        bucket_pivot = bucket_timeseries_zone(df_zone, bucket_map)
+        st.line_chart(bucket_pivot)
 
-    with st.spinner("Calcul population par commune / année..."):
-        pop_long = compute_population_timeseries(df_zone)
+        st.download_button(
+            "⬇️ Télécharger CSV - tranches d’âge (zone)",
+            data=bucket_pivot.reset_index().to_csv(index=False).encode("utf-8"),
+            file_name="age_buckets_zone_timeseries.csv",
+            mime="text/csv",
+        )
 
-    # pivot years x communes
-    pop_pivot = pop_long.pivot(index="TIME_PERIOD", columns="CODE_INSEE", values="population").fillna(0).astype(int)
-    pop_pivot = pop_pivot.loc[sort_years(pop_pivot.index.tolist())]
+        # =========================================================
+        # BONUS: Mean age approx
+        # =========================================================
+        st.markdown("## Bonus : âge moyen approximatif (zone) par année")
+        mean_series = mean_age_timeseries_zone(df_zone, mid_map)
+        st.line_chart(mean_series)
 
-    # rename columns to commune names (unique + lisible)
-    renamed = {}
-    for code in pop_pivot.columns.tolist():
-        nom = name_map.get(str(code), str(code))
-        renamed[code] = f"{nom} ({code})"
-    pop_pivot = pop_pivot.rename(columns=renamed)
-
-    # add zone total
-    pop_pivot["TOTAL ZONE"] = pop_pivot.sum(axis=1)
-
-    st.line_chart(pop_pivot)
-
-    st.download_button(
-        "⬇️ Télécharger CSV - population (communes + total zone)",
-        data=pop_pivot.reset_index().rename(columns={"TIME_PERIOD": "year"}).to_csv(index=False).encode("utf-8"),
-        file_name="population_zone_timeseries.csv",
-        mime="text/csv",
-    )
-
-    # -----------------------------
-    # 2) Évolution par tranches d’âge (zone)
-    # -----------------------------
-    st.markdown("## 2) Évolution de la population par tranches d’âge (zone)")
-
-    with st.spinner("Calcul tranches d'âge / année (zone)..."):
-        bucket_pivot = compute_bucket_timeseries_zone(df_zone, bucket_map)
-
-    st.line_chart(bucket_pivot)
-
-    st.download_button(
-        "⬇️ Télécharger CSV - tranches d’âge (zone)",
-        data=bucket_pivot.reset_index().rename(columns={"TIME_PERIOD": "year"}).to_csv(index=False).encode("utf-8"),
-        file_name="age_buckets_zone_timeseries.csv",
-        mime="text/csv",
-    )
-
-    # -----------------------------
-    # Bonus: âge moyen approximatif (zone) par année
-    # -----------------------------
-    st.markdown("## Bonus : âge moyen approximatif (zone) par année")
-    with st.spinner("Calcul âge moyen approximatif par année..."):
-        # On agrège au niveau (TIME_PERIOD, AGE) puis on calcule une moyenne pondérée
-        d = df_zone.copy()
-        d["OBS_VALUE"] = pd.to_numeric(d["OBS_VALUE"], errors="coerce").fillna(0.0)
-        d["AGE"] = d["AGE"].astype(str)
-
-        # midpoints par AGE (map)
-        mid_map = {}
-        for a in age_values:
-            amin, amax = parse_age_value(a)
-            mid_map[a] = age_midpoint(amin, amax)
-
-        d["age_mid"] = d["AGE"].map(mid_map)
-        d = d.dropna(subset=["age_mid"])
-
-        g = d.groupby(["TIME_PERIOD"], as_index=False).apply(
-            lambda x: pd.Series({
-                "age_moyen_approx": (x["age_mid"] * x["OBS_VALUE"]).sum() / max(x["OBS_VALUE"].sum(), 1.0)
-            })
-        ).reset_index(drop=True)
-
-        g["TIME_PERIOD"] = g["TIME_PERIOD"].astype(str)
-        g = g.sort_values("TIME_PERIOD", key=lambda s: s.map(lambda v: int(v) if str(v).isdigit() else v))
-        mean_series = g.set_index("TIME_PERIOD")["age_moyen_approx"]
-
-    st.line_chart(mean_series)
+except Exception as e:
+    st.error("Erreur dans l'app (trace ci-dessous) :")
+    st.exception(e)
